@@ -4324,6 +4324,62 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// Regression test: Vulkan mid-graph prealloc_y growth bug.
+// Two ops in one graph — the first is a tiny MUL_MAT (prealloc_y=0), the second is a
+// large MUL_MAT_ID with n_tokens>8 (matrix path) that forces prealloc_y to grow.
+// Without the prescan fix, ggml_vk_preallocate_buffers frees prealloc_y while the
+// command buffer is still being built, causing the use-after-free / stack corruption.
+struct test_mul_mat_id_prescan : public test_case {
+    const ggml_type type_a;
+    const int       n_mats;
+    const int       n_used;
+    const int64_t   m;
+    const int64_t   k;
+    const int64_t   n_tokens;
+
+    std::string vars() override { return VARS_TO_STR6(type_a, n_mats, n_used, m, k, n_tokens); }
+    double      max_nmse_err() override { return 5e-4; }
+    bool        run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_PRESCAN"; }
+
+    test_mul_mat_id_prescan(
+            ggml_type type_a = GGML_TYPE_F16, int n_mats = 512, int n_used = 2,
+            int64_t m = 128, int64_t k = 256, int64_t n_tokens = 16)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), k(k), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // Part 1: tiny MUL_MAT — does NOT use prealloc_y; prealloc_size_y stays 0 after this.
+        const int64_t k_small = 4;
+        ggml_tensor * sa = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_small, m);
+        ggml_tensor * sb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_small, n_used);
+        ggml_set_name(sa, "sa");
+        ggml_set_name(sb, "sb");
+        ggml_tensor * small_out = ggml_mul_mat(ctx, sa, sb);
+        ggml_set_name(small_out, "small_out");
+
+        // Part 2: large MUL_MAT_ID with n_tokens>8 → matrix path → uses prealloc_y.
+        // Without prescan this grows prealloc_y mid-graph with an open command buffer.
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        ggml_set_name(ids_storage, "ids_storage");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_storage, n_used, n_tokens, ids_storage->nb[1], 0);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * bl = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n_tokens);
+        ggml_set_name(bl, "bl");
+        ggml_tensor * large_out = ggml_mul_mat_id(ctx, as, bl, ids);
+        ggml_set_name(large_out, "large_out");
+
+        // Combine both ops so the graph executor must run both in a single graph compute.
+        // small_out (m, n_used) broadcasts over large_out (m, n_used, n_tokens).
+        return ggml_add(ctx, large_out, small_out);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -8521,6 +8577,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    // Vulkan mid-graph prealloc_y growth regression (n_tokens>8 forces matrix path)
+    // On unfixed builds this triggers a use-after-free / stack corruption crash.
+    test_cases.emplace_back(new test_mul_mat_id_prescan(GGML_TYPE_F16,  512, 2, 128, 256, 16));
+    test_cases.emplace_back(new test_mul_mat_id_prescan(GGML_TYPE_Q4_K, 512, 2, 128, 256, 16));
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
